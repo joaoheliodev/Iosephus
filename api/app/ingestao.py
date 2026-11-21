@@ -1,4 +1,5 @@
 """Ingestão: o coletor manda o log, a API calcula o hash e grava o fato bruto no MongoDB."""
+import ipaddress
 import json
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -12,6 +13,7 @@ from .db import mongo, mysql
 from .dominio import sha256
 
 router = APIRouter(prefix="/api", tags=["ingestão"])
+MAX_ID = 4_294_967_295  # INT UNSIGNED do MySQL
 
 
 class Fonte(BaseModel):
@@ -26,10 +28,22 @@ class Rede(BaseModel):
     porta_destino: int | None = Field(default=None, ge=0, le=65535)
     protocolo: str | None = Field(default=None, max_length=10)
 
+    @field_validator("ip_origem", "ip_destino")
+    @classmethod
+    def ip_valido(cls, v: str | None) -> str | None:
+        """Só aceita IP de verdade: o valor vai para título, histórico e log do motor."""
+        if v is None or v.strip() in ("", "-"):  # o Windows grava "-" quando não há IP
+            return None
+        try:
+            ipaddress.ip_address(v)
+        except ValueError:
+            raise ValueError("IP inválido") from None
+        return v
+
 
 class EventoIn(BaseModel):
-    organizacao_id: int = Field(gt=0)
-    ativo_id: int | None = Field(default=None, gt=0)  # se vier vazio, resolve pelo IP de destino
+    organizacao_id: int = Field(gt=0, le=MAX_ID)
+    ativo_id: int | None = Field(default=None, gt=0, le=MAX_ID)  # se vier vazio, resolve pelo IP de destino
     fonte: Fonte
     ocorrido_em: datetime
     severidade: int | None = Field(default=None, ge=0, le=10)
@@ -62,16 +76,28 @@ def _resolver_ativos(eventos: list[EventoIn]) -> dict[tuple[int, str], int]:
     return {(r.organizacao_id, r.ip): r.id for r in rows}
 
 
-@router.post("/eventos", status_code=201, dependencies=[Depends(chave_coletor)])
-def receber(lote: Lote):
+@router.post("/eventos", status_code=201)
+def receber(lote: Lote, org_da_chave: int | None = Depends(chave_coletor)):
     orgs = sorted({e.organizacao_id for e in lote.eventos})
+    # Chave entregue a um cliente só grava eventos do próprio cliente
+    if org_da_chave is not None and orgs != [org_da_chave]:
+        raise HTTPException(403, "Esta chave de coletor só envia eventos da própria organização")
+    informados = sorted({e.ativo_id for e in lote.eventos if e.ativo_id is not None})
     with mysql().connect() as c:
         existentes = set(c.execute(
             text("SELECT id FROM organizacoes WHERE id IN :ids").bindparams(bindparam("ids", expanding=True)),
             {"ids": orgs}).scalars().all())
+        dono_do_ativo = dict(c.execute(
+            text("SELECT id, organizacao_id FROM ativos WHERE id IN :ids")
+            .bindparams(bindparam("ids", expanding=True)), {"ids": informados}).all()) if informados else {}
     desconhecidas = set(orgs) - existentes
     if desconhecidas:
         raise HTTPException(422, f"Organização inexistente: {sorted(desconhecidas)}")
+    # ativo_id de outro cliente ligaria o incidente (e o detalhe que o gestor vê) a um ativo alheio
+    alheios = sorted({e.ativo_id for e in lote.eventos
+                      if e.ativo_id is not None and dono_do_ativo.get(e.ativo_id) != e.organizacao_id})
+    if alheios:
+        raise HTTPException(422, f"Ativo inexistente na organização do evento: {alheios}")
 
     ativos = _resolver_ativos(lote.eventos)
     agora = datetime.now(timezone.utc)

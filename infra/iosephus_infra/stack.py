@@ -21,6 +21,11 @@ RAIZ_DO_REPO = Path(__file__).resolve().parents[2]
 PARAMETRO_CODIGO = "/iosephus/codigo-s3"
 COMPOSE_VERSAO = "v2.32.4"
 BUILDX_VERSAO = "v0.20.1"
+# SHA-256 dos checksums.txt de cada release. Ao trocar a versão, troque os hashes também
+COMPOSE_SHA256 = {"aarch64": "0c4591cf3b1ed039adcd803dbbeddf757375fc08c11245b0154135f838495a2f",
+                  "x86_64": "ed1917fb54db184192ea9d0717bcd59e3662ea79db48bff36d3475516c480a6b"}
+BUILDX_SHA256 = {"aarch64": "f7d867e9f1a3c00b32dd580f56594e229df05e3fb1b083b7099c91c2e7d2ce1e",
+                 "x86_64": "8c38f60308a895fa570f1410e453c5de11aafd65a99fa99965d96d24b6225a78"}
 
 
 class IosephusStack(Stack):
@@ -124,12 +129,23 @@ systemctl enable --now docker
 
 # Docker Compose e Buildx (o Amazon Linux 2023 não traz os plugins)
 ARQ=$(uname -m | sed 's/aarch64/arm64/; s/x86_64/amd64/')
-mkdir -p /usr/local/lib/docker/cli-plugins
+case "$(uname -m)" in
+  aarch64) COMPOSE_SHA={COMPOSE_SHA256["aarch64"]}; BUILDX_SHA={BUILDX_SHA256["aarch64"]} ;;
+  x86_64)  COMPOSE_SHA={COMPOSE_SHA256["x86_64"]}; BUILDX_SHA={BUILDX_SHA256["x86_64"]} ;;
+  *) echo "arquitetura sem hash conhecido: $(uname -m)" >&2; exit 1 ;;
+esac
+PLUGINS=/usr/local/lib/docker/cli-plugins
+mkdir -p "$PLUGINS"
 curl -fsSL "https://github.com/docker/compose/releases/download/{COMPOSE_VERSAO}/docker-compose-linux-$(uname -m)" \\
-  -o /usr/local/lib/docker/cli-plugins/docker-compose
+  -o "$PLUGINS/docker-compose.baixado"
 curl -fsSL "https://github.com/docker/buildx/releases/download/{BUILDX_VERSAO}/buildx-{BUILDX_VERSAO}.linux-$ARQ" \\
-  -o /usr/local/lib/docker/cli-plugins/docker-buildx
-chmod +x /usr/local/lib/docker/cli-plugins/*
+  -o "$PLUGINS/docker-buildx.baixado"
+# Rodam como root: só instala se o SHA-256 bater com o fixado no código
+printf '%s  %s\\n' "$COMPOSE_SHA" "$PLUGINS/docker-compose.baixado" "$BUILDX_SHA" "$PLUGINS/docker-buildx.baixado" \\
+  | sha256sum -c - || {{ rm -f "$PLUGINS"/*.baixado; exit 1; }}
+mv "$PLUGINS/docker-compose.baixado" "$PLUGINS/docker-compose"
+mv "$PLUGINS/docker-buildx.baixado" "$PLUGINS/docker-buildx"
+chmod 755 "$PLUGINS/docker-compose" "$PLUGINS/docker-buildx"
 
 # 2 GB de swap: folga para MySQL + MongoDB em 2 GB de RAM
 if [ ! -f /swapfile ]; then
@@ -144,8 +160,10 @@ cat > /opt/iosephus/atualizar.sh <<'FIM'
 set -euo pipefail
 cd /opt/iosephus
 URL=$(aws ssm get-parameter --region {regiao} --name {PARAMETRO_CODIGO} --query Parameter.Value --output text)
-aws s3 cp --region {regiao} --only-show-errors "$URL" /tmp/iosephus.zip
-rm -rf app.novo && mkdir app.novo && unzip -q /tmp/iosephus.zip -d app.novo && rm /tmp/iosephus.zip
+ZIP=$(mktemp)   # nome imprevisível: um /tmp/iosephus.zip fixo aceitaria symlink plantado
+trap 'rm -f "$ZIP"' EXIT
+aws s3 cp --region {regiao} --only-show-errors "$URL" "$ZIP"
+rm -rf app.novo && mkdir app.novo && unzip -q "$ZIP" -d app.novo
 
 # Segredos gerados aqui, uma única vez; nunca passam pelo CDK nem pelo Git
 if [ ! -f .env ]; then
@@ -160,7 +178,7 @@ if [ ! -f .env ]; then
     echo "API_PORT=80"
   }} > .env
 fi
-cp .env app.novo/.env && chmod 600 app.novo/.env
+install -m 600 .env app.novo/.env   # já nasce 600 (cp + chmod deixava uma janela legível)
 
 rm -rf app.anterior
 [ -d app ] && mv app app.anterior

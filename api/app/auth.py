@@ -1,24 +1,30 @@
 """Login do dashboard (Argon2id + JWT) e chave dos coletores."""
 import secrets
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import jwt
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from .config import settings
 from .db import mysql
+from .limites import LimitadorDeTentativas
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 _hasher = PasswordHasher()  # Argon2id
 _bearer = HTTPBearer(auto_error=False)
 # Hash qualquer, para o tempo de resposta não revelar se o e-mail existe
 _HASH_FALSO = _hasher.hash(secrets.token_hex(16))
+_falhas_por_conta = LimitadorDeTentativas()   # chave: IP + e-mail
+_falhas_por_ip = LimitadorDeTentativas()      # chave: IP
+_trava_vagas = threading.Lock()
+_vagas: threading.BoundedSemaphore | None = None
 
 
 @dataclass
@@ -83,9 +89,22 @@ def exigir(permissao: str):
     return dependencia
 
 
-def chave_coletor(x_api_key: str = Header(default="")) -> None:
-    if not secrets.compare_digest(x_api_key.encode(), settings().ingest_api_key.encode()):
+def chave_coletor(x_api_key: str = Header(default="")) -> int | None:
+    """Valida a X-API-Key e devolve a organização a que ela está presa (None = chave do provedor).
+
+    Compara com todas as chaves, sempre, para o tempo de resposta não indicar qual quase bateu.
+    """
+    cfg = settings()
+    recebida = x_api_key.encode()
+    valida, organizacao = False, None
+    if recebida:
+        valida = secrets.compare_digest(recebida, cfg.ingest_api_key.encode())
+        for chave, org_id in cfg.chaves_por_organizacao().items():
+            if secrets.compare_digest(recebida, chave.encode()):
+                valida, organizacao = True, org_id
+    if not valida:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Chave de coletor inválida")
+    return organizacao
 
 
 class Login(BaseModel):
@@ -93,22 +112,66 @@ class Login(BaseModel):
     senha: str = Field(max_length=200)
 
 
+def _vagas_argon2() -> threading.BoundedSemaphore:
+    global _vagas
+    with _trava_vagas:
+        if _vagas is None:
+            _vagas = threading.BoundedSemaphore(settings().argon2_simultaneos)
+        return _vagas
+
+
+def _verificar_senha(hash_alvo: str, senha: str) -> bool:
+    """Argon2id com teto de verificações simultâneas: 40 logins em paralelo pediriam 2,5 GB de RAM."""
+    vagas = _vagas_argon2()
+    if not vagas.acquire(timeout=5):
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Servidor ocupado, tente de novo",
+                            headers={"Retry-After": "5"})
+    try:
+        return _hasher.verify(hash_alvo, senha)
+    except (VerificationError, InvalidHashError):
+        return False
+    finally:
+        vagas.release()
+
+
+def _muitas_tentativas(janela_s: int) -> HTTPException:
+    return HTTPException(status.HTTP_429_TOO_MANY_REQUESTS,
+                         "Muitas tentativas de login. Aguarde alguns minutos.",
+                         headers={"Retry-After": str(janela_s)})
+
+
 @router.post("/login")
-def login(dados: Login):
+def login(dados: Login, request: Request):
+    cfg = settings()
+    email = dados.email.strip().lower()
+    ip = request.client.host if request.client else "desconhecido"
+    conta = f"{ip}|{email}"
+    # A tentativa é reservada antes do Argon2 e devolvida se o login der certo
+    if not _falhas_por_ip.consumir(ip, cfg.login_falhas_por_ip, cfg.login_janela_s):
+        raise _muitas_tentativas(cfg.login_janela_s)
+    if not _falhas_por_conta.consumir(conta, cfg.login_falhas_por_conta, cfg.login_janela_s):
+        _falhas_por_ip.devolver(ip)
+        raise _muitas_tentativas(cfg.login_janela_s)
+
     with mysql().connect() as c:
         u = c.execute(text("""
             SELECT u.id, u.senha_hash, u.ativo, p.nome AS perfil
               FROM usuarios u JOIN perfis p ON p.id = u.perfil_id
-             WHERE u.email = :e"""), {"e": dados.email.strip().lower()}).first()
-    hash_alvo = u.senha_hash if u else _HASH_FALSO
+             WHERE u.email = :e"""), {"e": email}).first()
+    # Conta sem senha definida ("!" do seed) também gasta um Argon2: senão responde na hora
+    # e o tempo de resposta entrega quais e-mails existem
+    tem_hash = u is not None and u.senha_hash.startswith("$argon2")
     try:
-        _hasher.verify(hash_alvo, dados.senha)
-        senha_ok = u is not None
-    except (VerificationError, InvalidHashError):
-        senha_ok = False
+        senha_ok = _verificar_senha(u.senha_hash if tem_hash else _HASH_FALSO, dados.senha) and tem_hash
+    except HTTPException:  # servidor ocupado: não conta como tentativa errada
+        _falhas_por_conta.devolver(conta)
+        _falhas_por_ip.devolver(ip)
+        raise
     # Conta de serviço não entra no dashboard
     if not senha_ok or not u.ativo or u.perfil == "SERVICO":
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "E-mail ou senha incorretos")
+    _falhas_por_conta.esquecer(conta)
+    _falhas_por_ip.devolver(ip)
     expira = datetime.now(timezone.utc) + timedelta(hours=settings().jwt_horas)
     token = jwt.encode({"sub": str(u.id), "exp": expira}, settings().jwt_secret, algorithm="HS256")
     return {"token": token, "expira_em": expira}

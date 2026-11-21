@@ -65,7 +65,8 @@ def detalhe(incidente_id: int, usuario: Usuario = Depends(exigir("incidente.ler"
         ativos = [linha(r) for r in c.execute(text("""
             SELECT a.id, a.hostname, a.ip, a.tipo, a.sistema_operacional, a.criticidade, ia.papel
               FROM incidente_ativo ia JOIN ativos a ON a.id = ia.ativo_id
-             WHERE ia.incidente_id = :i"""), {"i": incidente_id}).all()]
+             WHERE ia.incidente_id = :i AND a.organizacao_id = :o"""),
+            {"i": incidente_id, "o": inc.organizacao_id}).all()]
         vulns = []
         if ativos:
             # Ativo atacado que também tem vulnerabilidade crítica aberta = prioridade máxima

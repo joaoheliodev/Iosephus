@@ -153,9 +153,9 @@ def _transacao_promocao(alerta, alerta_id, ids, hashes, servico) -> int:
             return existente
 
         alvo = None
-        if alerta.get("ativo_id"):
-            alvo = c.execute(text("SELECT hostname FROM ativos WHERE id = :id"),
-                             {"id": alerta["ativo_id"]}).scalar()
+        if alerta.get("ativo_id"):  # só ativo do próprio cliente entra no incidente
+            alvo = c.execute(text("SELECT hostname FROM ativos WHERE id = :id AND organizacao_id = :org"),
+                             {"id": alerta["ativo_id"], "org": alerta["organizacao_id"]}).scalar()
         titulo = f'{alerta["regra"]["nome"]} em {alvo or alerta["resumo"]["ip_origem"]}'[:200]
 
         # Prazos vêm do contrato do cliente: sem política, nenhuma linha é inserida
@@ -174,7 +174,7 @@ def _transacao_promocao(alerta, alerta_id, ids, hashes, servico) -> int:
             raise SemSLA()
         incidente_id = r.lastrowid
 
-        if alerta.get("ativo_id"):
+        if alvo is not None:
             c.execute(text("INSERT INTO incidente_ativo VALUES (:i, :a, 'ALVO')"),
                       {"i": incidente_id, "a": alerta["ativo_id"]})
         evidencias = [{"i": incidente_id, "e": str(eid), "h": hashes[eid], "u": servico}

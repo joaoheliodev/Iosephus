@@ -1,9 +1,11 @@
-fastapi==0.115.*
+# FastAPI 0.165 traz Starlette >= 1.6: corrige o DoS pelo cabeçalho Range nos arquivos
+# estáticos (CVE-2025-62727) e a remontagem de request.url pelo Host (CVE-2026-48710, CVE-2026-54282)
+fastapi==0.165.*
 uvicorn[standard]==0.32.*
 pydantic-settings==2.6.*
 SQLAlchemy==2.0.*
 PyMySQL==1.1.*
 cryptography>=43
-pymongo==4.10.*
+pymongo==4.20.*
 argon2-cffi==23.1.*
-PyJWT==2.10.*
+PyJWT==2.15.*

@@ -15,7 +15,8 @@ services:
       - mysql-dados:/var/lib/mysql
       - ./db/mysql:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      # Senha por variável (MYSQL_PWD), não na linha de comando: o ps do host mostra os argumentos
+      test: ["CMD-SHELL", "MYSQL_PWD=\"$$MYSQL_ROOT_PASSWORD\" mysqladmin ping -h 127.0.0.1 -uroot --silent"]
       interval: 10s
       timeout: 5s
       retries: 30
@@ -48,6 +49,7 @@ services:
       MYSQL_URL: mysql+pymysql://app_soc:${MYSQL_APP_PASSWORD}@mysql:3306/iosephus?charset=utf8mb4
       MONGO_URL: mongodb://app_soc:${MONGO_APP_PASSWORD}@mongo:27017/iosephus?authSource=iosephus
       INGEST_API_KEY: ${INGEST_API_KEY:?defina no .env}
+      INGEST_API_KEYS: ${INGEST_API_KEYS:-}
       JWT_SECRET: ${JWT_SECRET:?defina no .env}
     ports:
       # Padrão: só a própria máquina acessa. Na EC2, o .env troca para 0.0.0.0:80.
