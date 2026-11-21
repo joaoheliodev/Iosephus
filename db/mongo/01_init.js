@@ -4,10 +4,20 @@
 
 db = db.getSiblingDB("iosephus");
 
-// Usuário da aplicação: só lê e escreve no banco iosephus
+// Usuário da aplicação com o mínimo de privilégio, como no MySQL: a API não apaga nada.
+// Com readWrite ela poderia remover o log bruto de uma evidência (ou dropar a coleção).
 const senhaApp = process.env.MONGO_APP_PASSWORD;
 if (!senhaApp) throw new Error("MONGO_APP_PASSWORD não definido");
-db.createUser({ user: "app_soc", pwd: senhaApp, roles: [{ role: "readWrite", db: "iosephus" }] });
+db.createRole({
+  role: "iosephus_app",
+  privileges: [
+    { resource: { db: "iosephus", collection: "eventos" },            actions: ["find", "insert", "update"] },
+    { resource: { db: "iosephus", collection: "alertas" },            actions: ["find", "insert", "update"] },
+    { resource: { db: "iosephus", collection: "indicadores_ameaca" }, actions: ["find"] }
+  ],   // varreduras e telemetria_rede entram aqui quando a API passar a usá-las
+  roles: []
+});
+db.createUser({ user: "app_soc", pwd: senhaApp, roles: [{ role: "iosephus_app", db: "iosephus" }] });
 
 // eventos: fato bruto, um envelope comum para qualquer fonte
 db.createCollection("eventos", {

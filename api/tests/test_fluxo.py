@@ -19,10 +19,12 @@ pytestmark = pytest.mark.skipif(not os.environ.get("IOSEPHUS_TESTE_MYSQL"),
                                 reason="precisa de MySQL local (IOSEPHUS_TESTE_MYSQL=1)")
 
 RAIZ = Path(__file__).resolve().parents[2]
-CHAVE = "chave-de-teste"
+CHAVE = "chave-de-teste-do-provedor-com-32-caracteres"
+CHAVE_VALE_VERDE = "chave-de-teste-presa-a-organizacao-7"
 os.environ.setdefault("MYSQL_URL", "mysql+pymysql://app_soc:teste@127.0.0.1:3306/iosephus?charset=utf8mb4")
 os.environ.setdefault("MONGO_URL", "mongodb://nao-usado")
 os.environ["INGEST_API_KEY"] = CHAVE
+os.environ["INGEST_API_KEYS"] = f"7:{CHAVE_VALE_VERDE}"
 os.environ["JWT_SECRET"] = "segredo-de-teste-com-tamanho-suficiente-32"
 os.environ["WORKER_ATIVO"] = "false"
 
@@ -188,3 +190,67 @@ def test_app_nao_apaga_evidencia():
     with pytest.raises(OperationalError) as erro, engine.begin() as c:
         c.execute(text("DELETE FROM incidente_evidencia"))
     assert erro.value.orig.args[0] == 1142
+
+
+def _evento(**extra):
+    return {"organizacao_id": 7, "fonte": {"tipo": "dns", "produto": "x"},
+            "ocorrido_em": "2026-11-21T10:00:00Z", "bruto": "q"} | extra
+
+
+def test_chave_presa_a_organizacao(ambiente):
+    """A chave entregue a um cliente não grava eventos em nome de outro."""
+    cliente, _ = ambiente
+    h = {"X-API-Key": CHAVE_VALE_VERDE}
+    assert cliente.post("/api/eventos", json={"eventos": [_evento()]}, headers=h).status_code == 201
+    outro = {"eventos": [_evento(), _evento(organizacao_id=1)]}
+    assert cliente.post("/api/eventos", json=outro, headers=h).status_code == 403
+    # A chave do provedor continua valendo para qualquer organização
+    r = cliente.post("/api/eventos", json=outro, headers={"X-API-Key": CHAVE})
+    assert r.status_code == 201
+
+
+def test_ativo_de_outra_organizacao(ambiente):
+    """ativo_id informado pelo coletor precisa ser da organização do evento."""
+    cliente, _ = ambiente
+    h = {"X-API-Key": CHAVE}
+    for ativo in (42, 999999):  # 42 é da organização 7; 999999 não existe
+        r = cliente.post("/api/eventos", json={"eventos": [_evento(organizacao_id=1, ativo_id=ativo)]},
+                         headers=h)
+        assert r.status_code == 422, r.text
+    assert cliente.post("/api/eventos", json={"eventos": [_evento(ativo_id=42)]},
+                        headers=h).status_code == 201
+
+
+def test_limite_de_tentativas_de_login(ambiente):
+    from app import auth
+
+    cliente, _ = ambiente
+    auth._falhas_por_conta.zerar()
+    auth._falhas_por_ip.zerar()
+    try:
+        errada = {"email": "analista3@iosephus.local", "senha": "errada"}
+        for _ in range(5):
+            assert cliente.post("/api/auth/login", json=errada).status_code == 401
+        certa = {"email": "analista3@iosephus.local", "senha": "senha-de-teste-123"}
+        r = cliente.post("/api/auth/login", json=certa)
+        assert r.status_code == 429 and "Retry-After" in r.headers
+        # Outra conta do mesmo IP ainda entra (o limite por IP é maior)
+        _login(cliente, "analista2@iosephus.local")
+    finally:
+        auth._falhas_por_conta.zerar()
+        auth._falhas_por_ip.zerar()
+
+
+def test_conta_sem_senha_gasta_argon2(ambiente, monkeypatch):
+    """Conta com senha_hash "!" não pode responder mais rápido que e-mail inexistente."""
+    from app import auth
+
+    cliente, _ = ambiente
+    chamadas = []
+    original = auth._verificar_senha
+    monkeypatch.setattr(auth, "_verificar_senha", lambda h, s: chamadas.append(h) or original(h, s))
+    for email in ("admin@iosephus.local", "ninguem@iosephus.local"):  # sem senha / inexistente
+        assert cliente.post("/api/auth/login", json={"email": email, "senha": "x"}).status_code == 401
+    assert chamadas == [auth._HASH_FALSO, auth._HASH_FALSO]
+    auth._falhas_por_conta.zerar()
+    auth._falhas_por_ip.zerar()
