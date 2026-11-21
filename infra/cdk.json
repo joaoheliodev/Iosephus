@@ -1,0 +1,9 @@
+{
+  "app": "python3 app.py",
+  "context": {
+    "email_alerta": "",
+    "acesso_cidr": "",
+    "orcamento": "iosephus-20usd",
+    "tipo_instancia": "t4g.small"
+  }
+}

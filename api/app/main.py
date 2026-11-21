@@ -1,0 +1,89 @@
+import logging
+import threading
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy import text
+
+from . import auth, incidentes, ingestao, motor
+from .config import settings
+from .db import mongo, mysql
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("iosephus")
+ESTATICO = Path(__file__).parent / "static"
+
+
+def _laco_do_motor(parar: threading.Event) -> None:
+    """Correlação a cada 30 s e reconciliação a cada 5 min (uma réplica da API basta no MVP)."""
+    cfg = settings()
+    ultima_reconciliacao = 0.0
+    while not parar.is_set():
+        try:
+            motor.correlacionar()
+            if time.monotonic() - ultima_reconciliacao >= cfg.reconciliacao_intervalo_s:
+                r = motor.reconciliar()
+                ultima_reconciliacao = time.monotonic()
+                if any(r.values()):
+                    log.info("reconciliação: %s", r)
+        except Exception:
+            log.exception("erro no ciclo do motor")
+        parar.wait(cfg.correlacao_intervalo_s)
+
+
+@asynccontextmanager
+async def ciclo_de_vida(app: FastAPI):
+    parar = threading.Event()
+    if settings().worker_ativo:
+        threading.Thread(target=_laco_do_motor, args=(parar,), daemon=True, name="motor").start()
+    yield
+    parar.set()
+
+
+app = FastAPI(title="Iosephus SOC", version="0.1.0", lifespan=ciclo_de_vida,
+              docs_url="/api/docs", openapi_url="/api/openapi.json", redoc_url=None)
+app.include_router(auth.router)
+app.include_router(ingestao.router)
+app.include_router(incidentes.router)
+
+
+@app.middleware("http")
+async def cabecalhos_de_seguranca(request: Request, call_next):
+    resposta = await call_next(request)
+    resposta.headers["X-Content-Type-Options"] = "nosniff"
+    resposta.headers["X-Frame-Options"] = "DENY"
+    resposta.headers["Referrer-Policy"] = "no-referrer"
+    if not request.url.path.startswith("/api/docs"):
+        resposta.headers["Content-Security-Policy"] = (
+            "default-src 'self'; style-src 'self' https://fonts.googleapis.com; "
+            "font-src https://fonts.gstatic.com; img-src 'self' data:; frame-ancestors 'none'")
+    return resposta
+
+
+@app.get("/api/saude", tags=["infra"])
+def saude():
+    estado = {}
+    try:
+        with mysql().connect() as c:
+            c.execute(text("SELECT 1"))
+        estado["mysql"] = "ok"
+    except Exception:
+        estado["mysql"] = "erro"
+    try:
+        mongo().command("ping")
+        estado["mongodb"] = "ok"
+    except Exception:
+        estado["mongodb"] = "erro"
+    return estado
+
+
+app.mount("/static", StaticFiles(directory=ESTATICO), name="static")
+
+
+@app.get("/", include_in_schema=False)
+def dashboard():
+    return FileResponse(ESTATICO / "index.html")

@@ -1,0 +1,58 @@
+# Iosephus: MySQL (decisões) + MongoDB (fatos brutos) + API/dashboard.
+# Os bancos não publicam porta: só a API fala com eles, pela rede interna do compose.
+name: iosephus
+
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    command: ["--innodb-buffer-pool-size=256M", "--default-time-zone=+00:00"]
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?defina no .env}
+      MYSQL_DATABASE: iosephus
+      MYSQL_APP_PASSWORD: ${MYSQL_APP_PASSWORD:?defina no .env}
+    volumes:
+      - mysql-dados:/var/lib/mysql
+      - ./db/mysql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  mongo:
+    image: mongo:8.0
+    restart: unless-stopped
+    command: ["--wiredTigerCacheSizeGB", "0.25"]
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?defina no .env}
+      MONGO_INITDB_DATABASE: iosephus
+      MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD:?defina no .env}
+    volumes:
+      - mongo-dados:/data/db
+      - ./db/mongo:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  api:
+    build: ./api
+    restart: unless-stopped
+    depends_on:
+      mysql: { condition: service_healthy }
+      mongo: { condition: service_healthy }
+    environment:
+      MYSQL_URL: mysql+pymysql://app_soc:${MYSQL_APP_PASSWORD}@mysql:3306/iosephus?charset=utf8mb4
+      MONGO_URL: mongodb://app_soc:${MONGO_APP_PASSWORD}@mongo:27017/iosephus?authSource=iosephus
+      INGEST_API_KEY: ${INGEST_API_KEY:?defina no .env}
+      JWT_SECRET: ${JWT_SECRET:?defina no .env}
+    ports:
+      # Padrão: só a própria máquina acessa. Na EC2, o .env troca para 0.0.0.0:80.
+      - "${API_BIND:-127.0.0.1}:${API_PORT:-8000}:8000"
+
+volumes:
+  mysql-dados:
+  mongo-dados:

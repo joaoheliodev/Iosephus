@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Iosephus · SOC</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&family=EB+Garamond:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="topo">
+    <div class="marca">
+      <span class="nome">IOSEPHVS</span>
+      <span class="lema">CVSTOS · DATORVM</span>
+    </div>
+    <div id="sessao" class="sessao" hidden>
+      <span id="quem"></span>
+      <button id="sair" class="botao fantasma">Sair</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="tela-login" class="cartao login" hidden>
+      <h1>Entrar</h1>
+      <form id="form-login">
+        <label>E-mail <input id="email" type="email" autocomplete="username" required></label>
+        <label>Senha <input id="senha" type="password" autocomplete="current-password" required></label>
+        <button class="botao" type="submit">Entrar</button>
+        <p id="erro-login" class="erro" role="alert"></p>
+      </form>
+    </section>
+
+    <section id="tela-painel" hidden>
+      <div class="kpis">
+        <div class="kpi"><span class="valor" id="k-abertos">–</span><span class="rotulo">Abertos</span></div>
+        <div class="kpi critico"><span class="valor" id="k-criticos">–</span><span class="rotulo">Críticos</span></div>
+        <div class="kpi"><span class="valor" id="k-fila">–</span><span class="rotulo">Sem analista</span></div>
+        <div class="kpi alerta"><span class="valor" id="k-sla">–</span><span class="rotulo">SLA estourado</span></div>
+      </div>
+
+      <div class="colunas">
+        <section class="cartao">
+          <div class="cabecalho">
+            <h2>Fila de incidentes</h2>
+            <label class="alternar"><input type="checkbox" id="mostrar-encerrados"> encerrados</label>
+          </div>
+          <table class="fila">
+            <thead><tr><th>Nº</th><th>Cliente</th><th>Título</th><th>Sev.</th><th>Status</th><th>SLA</th></tr></thead>
+            <tbody id="linhas"></tbody>
+          </table>
+          <p id="vazio" class="vazio" hidden>Nenhum incidente. Rode <code>scripts/simular_ataque.py</code> para gerar um.</p>
+        </section>
+
+        <section class="cartao detalhe" id="detalhe">
+          <p class="vazio">Selecione um incidente.</p>
+        </section>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
