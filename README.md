@@ -10,7 +10,7 @@ Ingests security logs, correlates attacks in real time, opens SLA-tracked incide
 
 [![CI Tests](https://github.com/joaoheliodev/Iosephus/actions/workflows/testes.yml/badge.svg)](https://github.com/joaoheliodev/Iosephus/actions/workflows/testes.yml)
 ![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.165-009688?logo=fastapi&logoColor=white)
 ![MySQL 8.4](https://img.shields.io/badge/MySQL-8.4-4479A1?logo=mysql&logoColor=white)
 ![MongoDB 8.0](https://img.shields.io/badge/MongoDB-8.0-47A248?logo=mongodb&logoColor=white)
 ![Docker Compose](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
@@ -68,10 +68,10 @@ When an alert is promoted to an incident, Iosephus enforces a strict write order
 ## Key Features
 
 - **Log Ingestion (`POST /api/eventos`)**
-  - Authenticated via `X-API-Key` header, accepting batches of up to 1,000 events (`autenticacao`, `firewall`, `ids`, `edr`, `dns`).
-  - Computes `SHA-256` over the untouched raw log (`bruto`) on arrival.
-  - Automatically resolves `ativo_id` from the MySQL asset inventory using `(organizacao_id, ip_destino)`.
-  - Persists events in MongoDB with `$jsonSchema` validation and a **180-day partial TTL** (`preservado: false`).
+  - Authenticated via `X-API-Key` header, accepting batches of 1–1,000 events (`autenticacao`, `firewall`, `ids`, `edr`, `dns`) up to 10 MB per request.
+  - Supports **per-client API keys** via `INGEST_API_KEYS` (`org_id:key,...`), locking each collector to its own organization (`403` on cross-tenant writes). `INGEST_API_KEY` acts as the provider-wide key and must never be handed out to clients.
+  - Validates IP addresses strictly and verifies that any supplied `ativo_id` belongs to the event's organization (`422` otherwise).
+  - Computes `SHA-256` over the untouched raw log (`bruto`) on arrival, resolves `ativo_id` from `(organizacao_id, ip_destino)`, and stores events in MongoDB with `$jsonSchema` validation and a **180-day partial TTL** (`preservado: false`).
 
 - **Correlation & Threat Enrichment Engine**
   - Runs every 30 seconds in a background worker (`motor.py`), loading active rules dynamically from MySQL `regras_deteccao`.
@@ -97,12 +97,13 @@ When an alert is promoted to an incident, Iosephus enforces a strict write order
 
 | Layer | Implementation |
 |---|---|
-| **Authentication** | Argon2id password hashing with constant-time dummy verification (prevents user enumeration); HS256 JWT (8-hour expiration); `SERVICO` accounts blocked from dashboard login. |
-| **RBAC & Multi-Tenancy** | 5 roles (`ADMIN`, `ANALISTA_N1`, `ANALISTA_N2`, `GESTOR_CLIENTE`, `SERVICO`) with granular permissions. Client managers see only their own organization; cross-tenant lookups return `404` to avoid existence leaks. |
-| **Database Immutability** | The application MySQL user (`app_soc`) has **least-privilege `GRANT`s**: only `SELECT` and `INSERT` on `incidente_evidencia` and `incidente_historico`—even a compromised API cannot alter or delete chain-of-custody records. |
-| **Web Hardening** | DOM rendered exclusively via `textContent` (never `innerHTML`), strict `Content-Security-Policy`, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`. |
-| **Container Isolation** | API runs as non-root user (`uid 10001`). MySQL and MongoDB publish no host ports and communicate strictly over Compose's internal network. |
-| **LGPD / Regulatory Readiness** | Schema includes `pequeno_porte_lgpd` (double ANPD notification windows), `ciencia_dados_pessoais_em`, `comunicado_anpd_em`, alphanumeric `CHAR(14)` CNPJ support, and `mfa_habilitado`. |
+| **Fail-Closed Secrets** | The API refuses to start if `JWT_SECRET` or `INGEST_API_KEY` (or any per-client key in `INGEST_API_KEYS`) is empty or shorter than **32 characters** (`hide_input_in_errors=True` keeps secrets out of logs). |
+| **Authentication & Brute-Force Protection** | Argon2id password hashing with constant-time dummy verification (including on locked `"!"` accounts to prevent enumeration); login rate limiting (**5 failures/IP+email**, **20 failures/IP** per 15 min → `429` + `Retry-After`); concurrency cap of **4 simultaneous Argon2 verifications** (`503`) to prevent RAM exhaustion; HS256 JWT (8 h expiry); `SERVICO` accounts blocked from dashboard login. |
+| **RBAC & Multi-Tenancy** | 5 roles (`ADMIN`, `ANALISTA_N1`, `ANALISTA_N2`, `GESTOR_CLIENTE`, `SERVICO`) with granular permissions. Per-client collector keys (`INGEST_API_KEYS`) and `ativo_id` ownership checks enforce tenant boundaries on ingestion; cross-tenant incident lookups return `404`. |
+| **Dual-Database Immutability** | Both databases enforce append-only custody at the database privilege layer: MySQL `app_soc` only has `SELECT` + `INSERT` on `incidente_evidencia` and `incidente_historico`, and MongoDB `app_soc` uses the custom `iosephus_app` role (`find`/`insert`/`update` only—no `delete` or `drop`). Even a compromised API cannot erase evidence. |
+| **Web & Request Hardening** | ASGI body-size limiter (`413` above 64 KB globally, 10 MB on `/api/eventos`, including chunked requests); DOM rendered solely via `textContent` (never `innerHTML`); strict `Content-Security-Policy` evaluated on `request.scope["path"]`; `Cache-Control: no-store` on `/api/*`; `X-Frame-Options: DENY`; `X-Content-Type-Options: nosniff`; `Referrer-Policy: no-referrer`. |
+| **Container & Infra Hardening** | API runs as non-root (`uid 10001`); MySQL/MongoDB publish no host ports; MySQL healthcheck passes credentials via `MYSQL_PWD` (never CLI args); CDK verifies SHA-256 checksums for Docker Compose/Buildx binaries and writes `.env` atomically with `install -m 600`. |
+| **LGPD / Regulatory Readiness** | Schema includes `pequeno_porte_lgpd` (double ANPD notification windows), `ciencia_dados_pessoais_em`, `comunicado_anpd_em`, alphanumeric `CHAR(14)` CNPJ support, and `mfa_habilitado` (not yet enforced on login). |
 
 ---
 
@@ -111,7 +112,7 @@ When an alert is promoted to an incident, Iosephus enforces a strict write order
 **Prerequisites:** Docker with the Compose plugin and Python 3.9+.
 
 ```bash
-# 1. Generate random secrets (.env with restricted permissions)
+# 1. Generate random 64-char hex secrets (.env with restricted permissions)
 ./scripts/gerar_env.sh > .env && chmod 600 .env
 
 # 2. Start MySQL 8.4, MongoDB 8.0, and the FastAPI app (auto-initializes schemas & demo seed)
@@ -175,9 +176,9 @@ Within 30 seconds, the engine:
 | Method | Endpoint | Auth | Description |
 |---|---|---|---|
 | `GET` | `/api/saude` | Public | Health check for MySQL and MongoDB connectivity |
-| `POST` | `/api/auth/login` | Public | Authenticate with email/password and receive a JWT |
+| `POST` | `/api/auth/login` | Public (rate-limited) | Authenticate with email/password and receive a JWT |
 | `GET` | `/api/auth/eu` | Bearer JWT | Return current user profile and RBAC permissions |
-| `POST` | `/api/eventos` | `X-API-Key` | Ingest a batch of 1–1,000 raw security events |
+| `POST` | `/api/eventos` | `X-API-Key` | Ingest a batch of 1–1,000 raw security events (per-client or provider key) |
 | `GET` | `/api/incidentes` | Bearer JWT (`incidente.ler`) | List incidents ordered by SLA deadline (`?abertos=true\|false`) |
 | `GET` | `/api/incidentes/resumo` | Bearer JWT (`incidente.ler`) | Return dashboard KPI counters |
 | `GET` | `/api/incidentes/{id}` | Bearer JWT (`incidente.ler`) | Incident detail, assets, open CVEs, verified evidence, and audit log |
@@ -202,7 +203,7 @@ python -m app.cli reconciliar             # Trigger one idempotent reconciliatio
 
 Everything deploys onto a single ARM64 **`t4g.small`** EC2 instance (2 GB RAM + 2 GB swap) running Docker Compose, defined in Python with AWS CDK v2 (`infra/`).
 
-- **Zero secrets in Git/CDK**: Code is uploaded as an S3 asset (works with private repos). The instance downloads the package on first boot and generates its own `.env` (`chmod 600`).
+- **Zero secrets in Git/CDK**: Code is uploaded as an S3 asset (works with private repos). The instance downloads the package on first boot, verifies SHA-256 checksums for Docker Compose/Buildx binaries, and generates its own `.env` (`install -m 600`).
 - **Closed by default**: Zero inbound ports open to the internet. Access the dashboard and shell via **AWS Systems Manager (SSM) Session Manager** (no SSH, no key pairs, encrypted GP3 disk, IMDSv2 required).
 - **Non-destructive updates**: `user_data_causes_replacement=False` preserves the EC2 instance and Docker volumes across code deployments.
 
@@ -226,12 +227,15 @@ The stack outputs ready-to-run commands:
 
 > **Note:** `TunelDashboard` and `Terminal` require the AWS [`session-manager-plugin`](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html).
 
-On first deployment, set an analyst password via the SSM terminal:
+On first deployment, set an analyst password and issue a per-client collector key via the SSM terminal (do not share the provider `INGEST_API_KEY` with clients):
 
 ```bash
 sudo -i
 cd /opt/iosephus/app && docker compose exec api python -m app.cli definir-senha analista2@iosephus.local
-grep INGEST_API_KEY /opt/iosephus/.env   # Copy collector API key
+
+# Issue a collector key locked to organization 7 (Prefeitura de Vale Verde) and reload
+echo "INGEST_API_KEYS=7:$(openssl rand -hex 32)" >> /opt/iosephus/.env
+/opt/iosephus/atualizar.sh
 ```
 
 To optionally expose HTTP port 80 strictly to your own IP (prefer the SSM tunnel; add a domain + TLS reverse proxy such as Caddy for production exposure):
@@ -259,15 +263,15 @@ When stopped, the instance costs only the EBS disk (~$1.60/month). Passing `-c e
 ```bash
 cd api && pip install -r requirements-dev.txt
 
-# 1. Pure domain unit tests (SHA-256, NIST transitions, IoC severity, integrity states)
+# 1. Pure domain & security unit tests (no database required)
 pytest
 
-# 2. Full end-to-end integration tests against real MySQL 8.4 (real schema & GRANTs; mongomock for MongoDB)
+# 2. Full end-to-end suite (23 tests) against real MySQL 8.4 (real schema & GRANTs; mongomock for MongoDB)
 MYSQL_APP_PASSWORD=teste ../scripts/criar_banco_teste.sh
 IOSEPHUS_TESTE_MYSQL=1 pytest
 ```
 
-GitHub Actions (`.github/workflows/testes.yml`) runs both suites automatically on every push and pull request against a live MySQL 8.4 service container, including a direct test verifying that `app_soc` receives MySQL error `1142` (`DELETE command denied`) when attempting to delete evidence.
+GitHub Actions (`.github/workflows/testes.yml`, with commit-pinned actions) runs all **23 tests** automatically on every push and pull request against a live MySQL 8.4 container—covering domain logic, E2E correlation/promotion/reconciliation, evidence tampering, optimistic locking, per-client API key isolation, cross-tenant `ativo_id` rejection, login rate limiting, timing-safe Argon2 checks, body-size limits (`413`), security headers, and MySQL `GRANT` enforcement (`1142 DELETE command denied`).
 
 ---
 
@@ -277,36 +281,39 @@ GitHub Actions (`.github/workflows/testes.yml`) runs both suites automatically o
 .
 ├── api/
 │   ├── Dockerfile                 # python:3.12-slim, non-root user (uid 10001), healthcheck
-│   ├── requirements.txt           # FastAPI, Uvicorn, SQLAlchemy, PyMySQL, PyMongo, Argon2, PyJWT
+│   ├── pytest.ini                 # pythonpath = . for local and CI test runs
+│   ├── requirements.txt           # FastAPI 0.165, Uvicorn, SQLAlchemy, PyMySQL, PyMongo 4.20, Argon2, PyJWT 2.15
 │   ├── app/
-│   │   ├── main.py                # FastAPI entrypoint, security headers, background engine loop
-│   │   ├── config.py              # Pydantic Settings (.env / environment variables)
+│   │   ├── main.py                # FastAPI entrypoint, security headers, body limit, engine loop
+│   │   ├── config.py              # Pydantic Settings (fail-closed ≥32-char secrets, per-org keys)
+│   │   ├── limites.py             # Login rate limiter & ASGI request body size middleware (413)
 │   │   ├── db.py                  # MySQL (UTC) & MongoDB connections + row serializers
 │   │   ├── dominio.py             # Pure business rules (SHA-256, NIST lifecycle, integrity)
-│   │   ├── auth.py                # Argon2id login, HS256 JWT, RBAC, collector API key
-│   │   ├── ingestao.py            # POST /api/eventos: hash, asset resolution, MongoDB write
+│   │   ├── auth.py                # Argon2id login (rate-limited + concurrency cap), JWT, RBAC, API keys
+│   │   ├── ingestao.py            # POST /api/eventos: org/asset/IP validation, hash, MongoDB write
 │   │   ├── motor.py               # Correlation, atomic promotion (MySQL → MongoDB), reconciliation
 │   │   ├── incidentes.py          # Queue, KPIs, detail + live integrity check, claim, status updates
 │   │   ├── cli.py                 # Admin CLI (password setup, manual correlation/reconciliation)
 │   │   └── static/                # Zero-dependency SOC dashboard (HTML/CSS/JS, strict CSP)
 │   └── tests/
 │       ├── test_dominio.py        # Domain unit tests
-│       └── test_fluxo.py          # Full E2E + tampering + optimistic locking + GRANT enforcement tests
+│       ├── test_seguranca.py      # Security unit tests (secrets, keys, rate limiter, IPs, 413, headers)
+│       └── test_fluxo.py          # E2E + tampering + optimistic lock + tenant isolation + GRANT tests
 ├── db/
 │   ├── mysql/
 │   │   ├── 01_schema.sql          # 14 InnoDB tables (RBAC, SLA, assets, CVEs, incidents, custody, audit)
 │   │   ├── 02_usuario_app.sh      # Least-privilege app_soc user (append-only evidence & history)
 │   │   └── 03_seed_demo.sql       # Vale Verde demo dataset (orgs, SLAs, users, BlueKeep CVE, Rule #15)
 │   └── mongo/
-│       └── 01_init.js             # $jsonSchema, partial 180-day TTL, indexes, time-series, demo IoC
+│       └── 01_init.js             # Custom iosephus_app role, $jsonSchema, partial 180-day TTL, IoC
 ├── infra/
 │   ├── app.py                     # AWS CDK v2 entrypoint
-│   └── iosephus_infra/stack.py    # VPC (no NAT), ARM64 EC2, SSM, S3 asset, Budgets auto-stop action
+│   └── iosephus_infra/stack.py    # VPC (no NAT), ARM64 EC2, SSM, S3 asset, SHA-256 checks, Budgets stop
 ├── scripts/
 │   ├── gerar_env.sh               # Random hex secrets generator
 │   ├── simular_ataque.py          # Vale Verde 45-event attack simulator (stdlib only)
 │   └── criar_banco_teste.sh       # Local MySQL test database initializer
-├── .github/workflows/testes.yml   # GitHub Actions CI pipeline (MySQL 8.4 + pytest)
+├── .github/workflows/testes.yml   # GitHub Actions CI pipeline (commit-pinned actions + MySQL 8.4)
 └── docker-compose.yml             # MySQL 8.4 + MongoDB 8.0 + FastAPI orchestration
 ```
 
@@ -316,8 +323,8 @@ GitHub Actions (`.github/workflows/testes.yml`) runs both suites automatically o
 
 - [ ] TLS termination with a custom domain (e.g., Caddy reverse proxy)
 - [ ] Production log collectors (Winlogbeat / Fluent Bit forwarding to `/api/eventos`)
-- [ ] Per-client ingestion API keys
-- [ ] MFA for dashboard login (schema already includes `usuarios.mfa_habilitado`)
+- [ ] Enforce MFA on dashboard login (the `usuarios.mfa_habilitado` column exists, but login does not enforce MFA yet)
+- [ ] JWT revocation on password change or logout
 - [ ] Automated volume backups to Amazon S3
 - [ ] Additional detection rule types in `motor.DETECTORES`
 - [ ] Automated vulnerability scan ingestion (`varreduras`) and network telemetry (`telemetria_rede`)

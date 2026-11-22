@@ -10,7 +10,7 @@ Recebe logs de segurança, correlaciona ataques em tempo real, abre incidentes c
 
 [![Testes CI](https://github.com/joaoheliodev/Iosephus/actions/workflows/testes.yml/badge.svg)](https://github.com/joaoheliodev/Iosephus/actions/workflows/testes.yml)
 ![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.165-009688?logo=fastapi&logoColor=white)
 ![MySQL 8.4](https://img.shields.io/badge/MySQL-8.4-4479A1?logo=mysql&logoColor=white)
 ![MongoDB 8.0](https://img.shields.io/badge/MongoDB-8.0-47A248?logo=mongodb&logoColor=white)
 ![Docker Compose](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
@@ -68,10 +68,10 @@ Quando um alerta é promovido a incidente, o motor impõe uma ordem rígida de e
 ## O que o MVP faz
 
 - **Ingestão de Logs (`POST /api/eventos`)**
-  - Autenticada pelo cabeçalho `X-API-Key`, aceitando lotes de 1 a 1.000 eventos (`autenticacao`, `firewall`, `ids`, `edr`, `dns`).
-  - Calcula o `SHA-256` do log bruto (`bruto`) no momento da chegada.
-  - Descobre automaticamente o `ativo_id` no inventário do MySQL a partir de `(organizacao_id, ip_destino)`.
-  - Persiste no MongoDB com validação `$jsonSchema` e **TTL parcial de 180 dias** (`preservado: false`).
+  - Autenticada pelo cabeçalho `X-API-Key`, aceitando lotes de 1 a 1.000 eventos (`autenticacao`, `firewall`, `ids`, `edr`, `dns`) de até 10 MB por requisição.
+  - Suporta **uma chave por cliente** via `INGEST_API_KEYS` (`org_id:chave,...`), travando cada coletor na própria organização (`403` se tentar gravar em outra). A `INGEST_API_KEY` é a chave do provedor e não deve ser entregue ao cliente.
+  - Valida IPs rigorosamente e garante que qualquer `ativo_id` informado pertença à organização do evento (`422` caso contrário).
+  - Calcula o `SHA-256` do log bruto (`bruto`) na chegada, resolve o `ativo_id` por `(organizacao_id, ip_destino)` e persiste no MongoDB com validação `$jsonSchema` e **TTL parcial de 180 dias** (`preservado: false`).
 
 - **Motor de Correlação e Inteligência de Ameaças**
   - Executa a cada 30 segundos em thread dedicada (`motor.py`), carregando as regras ativas diretamente de `regras_deteccao` no MySQL.
@@ -97,12 +97,13 @@ Quando um alerta é promovido a incidente, o motor impõe uma ordem rígida de e
 
 | Camada | Implementação |
 |---|---|
-| **Autenticação** | Senhas com **Argon2id** e verificação com hash falso em tempo constante (evita enumeração de e-mails); JWT `HS256` (validade de 8 h); contas `SERVICO` bloqueadas no login do dashboard. |
-| **RBAC e Multi-tenancy** | 5 perfis (`ADMIN`, `ANALISTA_N1`, `ANALISTA_N2`, `GESTOR_CLIENTE`, `SERVICO`) com permissões granulares. O gestor do cliente vê apenas a própria organização; consultas a incidentes de terceiros retornam `404` para não revelar existência. |
-| **Imutabilidade no Banco** | O usuário da aplicação no MySQL (`app_soc`) opera com **privilégio mínimo (`GRANT`)**: possui apenas `SELECT` e `INSERT` em `incidente_evidencia` e `incidente_historico` — nem a API comprometida consegue apagar ou alterar a cadeia de custódia. |
-| **Endurecimento Web** | Toda renderização usa `textContent` (nunca `innerHTML`), `Content-Security-Policy` restrita, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff` e `Referrer-Policy: no-referrer`. |
-| **Isolamento de Containers** | A API roda como usuário sem privilégios (`uid 10001`). MySQL e MongoDB não expõem portas no host e trafegam apenas na rede interna do Docker Compose. |
-| **Preparação para LGPD** | O schema já modela `pequeno_porte_lgpd` (prazos em dobro da ANPD), `ciencia_dados_pessoais_em`, `comunicado_anpd_em`, CNPJ alfanumérico (`CHAR(14)`) e `mfa_habilitado`. |
+| **Segredos Fail-Closed** | A API recusa subir se `JWT_SECRET`, `INGEST_API_KEY` ou qualquer chave em `INGEST_API_KEYS` estiver vazia ou com menos de **32 caracteres** (`hide_input_in_errors=True` evita vazar segredos no log). |
+| **Autenticação e Anti-Força Bruta** | Senhas com **Argon2id** e verificação com hash falso em tempo constante (inclusive para contas travadas com `"!"`); limite de tentativas no login (**5 erros/IP+e-mail**, **20 erros/IP** em 15 min → `429` + `Retry-After`); teto de **4 verificações Argon2 simultâneas** (`503`) contra exaustão de RAM; JWT `HS256` (8 h); contas `SERVICO` bloqueadas no dashboard. |
+| **RBAC e Multi-tenancy** | 5 perfis (`ADMIN`, `ANALISTA_N1`, `ANALISTA_N2`, `GESTOR_CLIENTE`, `SERVICO`) com permissões granulares. Chaves de coletor por cliente (`INGEST_API_KEYS`) e checagem de propriedade de `ativo_id` isolam a ingestão; consultas a incidentes de terceiros retornam `404`. |
+| **Imutabilidade nos Dois Bancos** | Tanto o MySQL (`app_soc` só tem `SELECT` e `INSERT` em `incidente_evidencia` e `incidente_historico`) quanto o MongoDB (papel customizado `iosephus_app`, apenas `find`/`insert`/`update`, sem `delete` ou `drop`) impedem a API de apagar ou alterar evidências. |
+| **Endurecimento Web e Requisições** | Middleware ASGI de limite de corpo (`413` acima de 64 KB no geral e 10 MB em `/api/eventos`, inclusive em chunks); renderização apenas por `textContent` (nunca `innerHTML`); `Content-Security-Policy` avaliada em `request.scope["path"]`; `Cache-Control: no-store` em `/api/*`; `X-Frame-Options: DENY`; `X-Content-Type-Options: nosniff`; `Referrer-Policy: no-referrer`. |
+| **Containers e Infra** | API roda sem privilégios (`uid 10001`); bancos sem portas expostas no host; healthcheck do MySQL via `MYSQL_PWD` (fora da linha de comando); CDK valida SHA-256 do Docker Compose/Buildx e grava `.env` atomicamente com `install -m 600`. |
+| **Preparação para LGPD** | O schema já modela `pequeno_porte_lgpd` (prazos em dobro da ANPD), `ciencia_dados_pessoais_em`, `comunicado_anpd_em`, CNPJ alfanumérico (`CHAR(14)`) e `mfa_habilitado` (ainda não exigido no login). |
 
 ---
 
@@ -111,7 +112,7 @@ Quando um alerta é promovido a incidente, o motor impõe uma ordem rígida de e
 **Pré-requisitos:** Docker com o plugin Compose e Python 3.9+.
 
 ```bash
-# 1. Gera segredos aleatórios (.env com permissão restrita)
+# 1. Gera segredos hex aleatórios de 64 caracteres (.env com permissão restrita)
 ./scripts/gerar_env.sh > .env && chmod 600 .env
 
 # 2. Sobe MySQL 8.4, MongoDB 8.0 e API (1ª vez inicializa schemas e seed automaticamente)
@@ -175,9 +176,9 @@ Em até 30 segundos, o motor:
 | Método | Endpoint | Autenticação | Descrição |
 |---|---|---|---|
 | `GET` | `/api/saude` | Público | Healthcheck de conectividade com MySQL e MongoDB |
-| `POST` | `/api/auth/login` | Público | Autentica e-mail/senha e retorna JWT |
+| `POST` | `/api/auth/login` | Público (com rate limit) | Autentica e-mail/senha e retorna JWT |
 | `GET` | `/api/auth/eu` | Bearer JWT | Retorna dados e permissões RBAC do usuário logado |
-| `POST` | `/api/eventos` | `X-API-Key` | Recebe lote de 1 a 1.000 eventos de segurança |
+| `POST` | `/api/eventos` | `X-API-Key` | Recebe lote de 1 a 1.000 eventos (chave do cliente ou do provedor) |
 | `GET` | `/api/incidentes` | Bearer JWT (`incidente.ler`) | Lista incidentes ordenados por SLA (`?abertos=true\|false`) |
 | `GET` | `/api/incidentes/resumo` | Bearer JWT (`incidente.ler`) | Retorna contadores KPI do dashboard |
 | `GET` | `/api/incidentes/{id}` | Bearer JWT (`incidente.ler`) | Detalhe, ativos, CVEs abertas, evidências verificadas e auditoria |
@@ -202,7 +203,7 @@ python -m app.cli reconciliar             # Executa um ciclo imediato de reconci
 
 Toda a stack roda numa única EC2 **`t4g.small`** (ARM64, 2 GB RAM + 2 GB swap) com Docker Compose, provisionada via AWS CDK v2 em Python (`infra/`).
 
-- **Zero segredos no Git/CDK**: O código sobe como asset no S3 (funciona com repositório privado). A instância baixa o pacote no primeiro boot e gera o próprio `.env` (`chmod 600`).
+- **Zero segredos no Git/CDK**: O código sobe como asset no S3 (funciona com repositório privado). A instância baixa o pacote no primeiro boot, valida os hashes SHA-256 dos binários do Docker Compose/Buildx e gera o próprio `.env` (`install -m 600`).
 - **Fechada por padrão**: Nenhuma porta aberta para a internet. Acesso ao dashboard e ao shell via **AWS Systems Manager (SSM) Session Manager** (sem SSH, sem chave `.pem`, disco GP3 criptografado e IMDSv2 obrigatório).
 - **Atualizações sem perda de dados**: `user_data_causes_replacement=False` mantém a EC2 e os volumes dos bancos intactos entre deploys.
 
@@ -226,12 +227,15 @@ O deploy imprime os comandos prontos de operação:
 
 > **Observação:** `TunelDashboard` e `Terminal` exigem o [`session-manager-plugin`](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html).
 
-No primeiro deploy, defina a senha de um analista pelo terminal SSM:
+No primeiro deploy, defina a senha de um analista e gere uma chave de coletor específica por cliente pelo terminal SSM (não entregue a `INGEST_API_KEY` do provedor ao cliente):
 
 ```bash
 sudo -i
 cd /opt/iosephus/app && docker compose exec api python -m app.cli definir-senha analista2@iosephus.local
-grep INGEST_API_KEY /opt/iosephus/.env   # Chave para configurar nos coletores
+
+# Gera uma chave de coletor presa à organização 7 (Prefeitura de Vale Verde) e recarrega
+echo "INGEST_API_KEYS=7:$(openssl rand -hex 32)" >> /opt/iosephus/.env
+/opt/iosephus/atualizar.sh
 ```
 
 Para liberar opcionalmente a porta HTTP 80 apenas para o seu IP (prefira o túnel SSM; para produção, coloque domínio e TLS com Caddy na frente da API):
@@ -259,15 +263,15 @@ Desligada, a instância custa apenas o disco (~US$ 1,60/mês). Com `-c email_ale
 ```bash
 cd api && pip install -r requirements-dev.txt
 
-# 1. Testes unitários das regras puras de domínio (SHA-256, transições NIST, severidade, integridade)
+# 1. Testes unitários de domínio e segurança (sem precisar de banco)
 pytest
 
-# 2. Fluxo completo contra MySQL 8.4 real (schema e GRANTs reais; MongoDB simulado com mongomock)
+# 2. Suíte completa (23 testes) contra MySQL 8.4 real (schema e GRANTs reais; MongoDB via mongomock)
 MYSQL_APP_PASSWORD=teste ../scripts/criar_banco_teste.sh
 IOSEPHUS_TESTE_MYSQL=1 pytest
 ```
 
-O GitHub Actions (`.github/workflows/testes.yml`) executa as duas suítes automaticamente a cada push e pull request com MySQL 8.4 real — incluindo teste que valida o erro MySQL `1142` (`DELETE command denied`) quando `app_soc` tenta apagar uma evidência.
+O GitHub Actions (`.github/workflows/testes.yml`, com actions fixadas por commit) executa todos os **23 testes** automaticamente a cada push e pull request com MySQL 8.4 real — cobrindo regras de domínio, correlação/promoção/reconciliação, detecção de adulteração, trava otimista, isolamento por chave de organização, validação de `ativo_id` e IP, rate limit de login, tempo constante no Argon2, limite de corpo (`413`), cabeçalhos de segurança e validação dos `GRANT`s (`1142 DELETE command denied`).
 
 ---
 
@@ -277,36 +281,39 @@ O GitHub Actions (`.github/workflows/testes.yml`) executa as duas suítes automa
 .
 ├── api/
 │   ├── Dockerfile                 # python:3.12-slim, usuário não-root (uid 10001), healthcheck
-│   ├── requirements.txt           # FastAPI, Uvicorn, SQLAlchemy, PyMySQL, PyMongo, Argon2, PyJWT
+│   ├── pytest.ini                 # pythonpath = . para rodar pytest localmente e no CI
+│   ├── requirements.txt           # FastAPI 0.165, Uvicorn, SQLAlchemy, PyMySQL, PyMongo 4.20, Argon2, PyJWT 2.15
 │   ├── app/
-│   │   ├── main.py                # Entrada FastAPI, cabeçalhos de segurança, loop do motor
-│   │   ├── config.py              # Pydantic Settings (.env / variáveis de ambiente)
+│   │   ├── main.py                # Entrada FastAPI, cabeçalhos de segurança, limite de corpo, loop do motor
+│   │   ├── config.py              # Pydantic Settings (segredos ≥32 chars fail-closed, chaves por cliente)
+│   │   ├── limites.py             # Limitador de tentativas de login e middleware ASGI de corpo (413)
 │   │   ├── db.py                  # Conexões MySQL (UTC) e MongoDB + serialização
 │   │   ├── dominio.py             # Regras puras (SHA-256, ciclo NIST, integridade)
-│   │   ├── auth.py                # Login Argon2id + JWT HS256, RBAC, chave de coletores
-│   │   ├── ingestao.py            # POST /api/eventos: hash, resolução de ativo, gravação MongoDB
+│   │   ├── auth.py                # Login Argon2id (rate limit + semáforo), JWT, RBAC, chaves de coletores
+│   │   ├── ingestao.py            # POST /api/eventos: validação org/ativo/IP, hash, gravação MongoDB
 │   │   ├── motor.py               # Correlação, promoção (MySQL → MongoDB) e reconciliação
 │   │   ├── incidentes.py          # Fila, KPIs, detalhe com integridade, assumir, mudar status
 │   │   ├── cli.py                 # CLI admin (definir senha, correlacionar, reconciliar)
 │   │   └── static/                # Dashboard SOC (HTML/CSS/JS puro, CSP restrita)
 │   └── tests/
 │       ├── test_dominio.py        # Testes unitários de domínio
-│       └── test_fluxo.py          # Testes E2E + adulteração + trava otimista + GRANTs
+│       ├── test_seguranca.py      # Testes unitários de segurança (segredos, chaves, rate limit, IP, 413, headers)
+│       └── test_fluxo.py          # Testes E2E + adulteração + trava otimista + isolamento + GRANTs
 ├── db/
 │   ├── mysql/
 │   │   ├── 01_schema.sql          # 14 tabelas InnoDB (RBAC, SLA, ativos, CVEs, incidentes, custódia)
 │   │   ├── 02_usuario_app.sh      # Usuário app_soc com GRANT mínimo (evidência/histórico append-only)
 │   │   └── 03_seed_demo.sql       # Seed Prefeitura de Vale Verde (orgs, SLAs, usuários, BlueKeep, Regra 15)
 │   └── mongo/
-│       └── 01_init.js             # $jsonSchema, TTL parcial de 180 dias, índices, time-series, IoC demo
+│       └── 01_init.js             # Papel iosephus_app, $jsonSchema, TTL parcial de 180 dias, IoC demo
 ├── infra/
 │   ├── app.py                     # Entrada AWS CDK v2
-│   └── iosephus_infra/stack.py    # VPC sem NAT, EC2 ARM64, SSM, asset S3, Budgets auto-stop
+│   └── iosephus_infra/stack.py    # VPC sem NAT, EC2 ARM64, SSM, asset S3, validação SHA-256, Budgets stop
 ├── scripts/
 │   ├── gerar_env.sh               # Gerador de segredos hex aleatórios
 │   ├── simular_ataque.py          # Simulador de 45 eventos do cenário Vale Verde (stdlib)
 │   └── criar_banco_teste.sh       # Inicializador do banco de teste MySQL local
-├── .github/workflows/testes.yml   # Pipeline CI no GitHub Actions (MySQL 8.4 + pytest)
+├── .github/workflows/testes.yml   # Pipeline CI no GitHub Actions (actions fixadas por SHA + MySQL 8.4)
 └── docker-compose.yml             # Orquestração MySQL 8.4 + MongoDB 8.0 + FastAPI
 ```
 
@@ -316,8 +323,8 @@ O GitHub Actions (`.github/workflows/testes.yml`) executa as duas suítes automa
 
 - [ ] TLS com domínio próprio (ex.: Caddy na frente da API)
 - [ ] Coletor real em produção (Winlogbeat ou Fluent Bit enviando para `/api/eventos`)
-- [ ] Uma chave de ingestão (`X-API-Key`) por cliente
-- [ ] MFA no login do dashboard (a coluna `usuarios.mfa_habilitado` já existe no schema)
+- [ ] Exigir MFA no login do dashboard (a coluna `usuarios.mfa_habilitado` existe no schema, mas o login ainda não exige MFA)
+- [ ] Revogar JWT ao trocar a senha ou encerrar sessão
 - [ ] Backup automático dos volumes para o Amazon S3
 - [ ] Novos tipos de regras em `motor.DETECTORES`
 - [ ] Ingestão automatizada de varreduras (`varreduras`) e telemetria de rede (`telemetria_rede`)
